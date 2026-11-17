@@ -120,7 +120,9 @@ jobs:
                 echo "::warning::$repo: could not download $wheel"
                 continue
               fi
-              if [ -n "$icon" ] && ! curl -sfL "$base/$icon" -o "$work/extensions/$icon"; then
+              # An icon file of the release is carried by the site; an address (the extension's
+              # EXTENSION_ICONURL) is left as it is.
+              if [ -n "$icon" ] && [[ "$icon" != *://* ]] && ! curl -sfL "$base/$icon" -o "$work/extensions/$icon"; then
                 echo "::warning::$repo: could not download $icon"
                 web="$(jq -c '.icon = ""' <<< "$web")"
               fi
