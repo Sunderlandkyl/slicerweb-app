@@ -13,6 +13,11 @@
 #      runtime was built with (build-info.json says which), and pushes it to the branch
 #      deploy/<channel>, which GitHub Pages serves.
 #
+# Slicer's Build workflow starts it each time it publishes the runtime, on the default branch of
+# this repository, when the "Slicer nightly" GitHub App of that Slicer repository is installed here:
+# it starts the workflow named slicer-nightly-web.yml of every repository the app is installed in.
+# It can also be run by hand.
+#
 # The runtime has no extensions yet: Slicer's CI does not build them, so the extensions that
 # application.json names are not part of it.
 name: Publish app
