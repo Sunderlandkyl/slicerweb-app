@@ -6,7 +6,8 @@
 > SlicerWeb of [Sunderlandkyl/SlicerWeb](https://github.com/Sunderlandkyl/SlicerWeb/tree/ci/slicer-actions)),
 > instead of one built and uploaded from a computer. Slicer's Build workflow starts the **Publish
 > app** workflow each time it publishes a runtime, through its "Slicer nightly" GitHub App installed
-> here; it can also be run by hand. That runtime has no extensions yet. See
+> here; it can also be run by hand. Its extensions are those of SlicerWeb that `application.json`
+> names; those of `extensions/` here are not built. See
 > `.github/workflows/slicer-nightly-web.yml`.
 
 The published [SlicerWeb](https://github.com/lassoan/SlicerWeb) application:

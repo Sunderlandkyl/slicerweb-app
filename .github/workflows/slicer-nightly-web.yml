@@ -7,8 +7,9 @@
 #
 #   1. takes them from there, adds the configuration of this application (application.json, but
 #      for the extensions) and records this repository in build-info.json, as SlicerWeb's build.py
-#      does, then uploads them to the release runtime-<channel> of this repository, as wheels.zip
-#      and extensions.zip;
+#      does, keeps of the extensions those that application.json names in extensions.slicerweb
+#      (and those they depend on), then uploads them to the release runtime-<channel> of this
+#      repository, as wheels.zip and extensions.zip;
 #   2. builds the site with the Publish app workflow of SlicerWeb, from the very SlicerWeb commit the
 #      runtime was built with (build-info.json says which), and pushes it to the branch
 #      deploy/<channel>, which GitHub Pages serves.
@@ -18,8 +19,8 @@
 # it starts the workflow named slicer-nightly-web.yml of every repository the app is installed in.
 # It can also be run by hand.
 #
-# The runtime has no extensions yet: Slicer's CI does not build them, so the extensions that
-# application.json names are not part of it.
+# Slicer's CI builds the extensions SlicerWeb describes (its extensions/ folder), so an extension of
+# this repository's own extensions/ folder is not part of the runtime: it is reported, and left out.
 name: Publish app
 
 on:
@@ -78,11 +79,47 @@ jobs:
           mv "$info.new" "$info"
 
           (cd "$work/wheels" && zip -q -r "$work/upload/wheels.zip" .)
-          cp "$work/slicerweb-extensions.zip" "$work/upload/extensions.zip"
+
+          # The extensions of this application: those application.json names, and those they
+          # depend on, out of all that Slicer's CI built. The others, their wheels and icons, are
+          # left out, as SlicerWeb's build leaves them out of an application's build.
+          mkdir -p "$work/extensions"
+          unzip -q "$work/slicerweb-extensions.zip" -d "$work/extensions"
+          python3 - "$work/extensions" application.json <<'PY'
+          import json, os, sys
+          folder, config = sys.argv[1], sys.argv[2]
+          index_path = os.path.join(folder, "index.json")
+          index = json.load(open(index_path))["extensions"]
+          by_name = {e["name"]: e for e in index}
+          wanted = list(json.load(open(config)).get("extensions", {}).get("slicerweb", []))
+          keep, missing = set(), []
+          while wanted:
+              name = wanted.pop()
+              if name in keep:
+                  continue
+              if name not in by_name:
+                  missing.append(name)
+                  continue
+              keep.add(name)
+              wanted.extend(by_name[name].get("depends", []))
+          for entry in index:
+              if entry["name"] not in keep:
+                  for f in (entry.get("wheel"), entry.get("icon")):
+                      if f and os.path.isfile(os.path.join(folder, f)):
+                          os.remove(os.path.join(folder, f))
+          json.dump({"extensions": [e for e in index if e["name"] in keep]}, open(index_path, "w"), indent=1)
+          print("Extensions:", ", ".join(sorted(keep)) or "none")
+          for name in sorted(set(missing)):
+              print(f"::warning::{name} (application.json) was not built by Slicer's CI; left out")
+          PY
+          if ls extensions/*.json >/dev/null 2>&1; then
+            echo "::warning::The extensions of extensions/ ($(cd extensions && ls *.json | sed 's/\.json$//' | xargs)) are not built by Slicer's CI; left out"
+          fi
+          (cd "$work/extensions" && zip -q -r "$work/upload/extensions.zip" .)
 
           built="$(jq -r '.date' "$info")"
           slicer="$(jq -r '.slicer.commit // "the revision SlicerWeb pins"' "$info")"
-          notes="WebAssembly runtime of SlicerWeb: the wheels the application is built on (VTK, ITK, the Slicer libraries and modules); no extensions yet.
+          notes="WebAssembly runtime of SlicerWeb: the wheels the application is built on (VTK, ITK, the Slicer libraries and modules) and the extension wheels.
 
           Built ${built} by the continuous integration of ${SLICER_REPOSITORY} (release ${SLICER_RELEASE}), from Slicer ${slicer} and ${slicerwebRepository} ${slicerwebRef:0:7}, for ${GITHUB_REPOSITORY} ${GITHUB_SHA:0:7}."
           if gh release view "$RUNTIME" >/dev/null 2>&1; then
