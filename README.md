@@ -1,5 +1,12 @@
 # slicerweb-app
 
+> **This fork** publishes the application with the WebAssembly runtime that Slicer's continuous
+> integration builds (the `nightly` release of
+> [Sunderlandkyl/Slicer](https://github.com/Sunderlandkyl/Slicer/releases/tag/nightly), with the
+> SlicerWeb of [Sunderlandkyl/SlicerWeb](https://github.com/Sunderlandkyl/SlicerWeb/tree/ci/slicer-actions)),
+> instead of one built and uploaded from a computer: run the **Publish app** workflow. That runtime
+> has no extensions yet. See `.github/workflows/publish-app.yml`.
+
 The published [SlicerWeb](https://github.com/lassoan/SlicerWeb) application:
 <https://lassoan.github.io/slicerweb-app/>
 

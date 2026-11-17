@@ -1,17 +1,20 @@
-# Publish the SlicerWeb application, https://lassoan.github.io/slicerweb-app/: SlicerWeb with the
-# configuration and extensions of application.json.
+# Publish the SlicerWeb application with the WebAssembly runtime that Slicer's continuous
+# integration builds, rather than one built and uploaded from a computer.
 #
-# Each channel - latest, or another such as stable or 1.0.0 - is published to a branch of its own,
-# deploy/<channel>, from a runtime release of its own, runtime-<channel>. GitHub Pages serves
-# deploy/latest. The runtime is built and uploaded from a local build (it takes hours and cannot be
-# built here), which then starts this workflow:
+# The Build workflow of Slicer (here Sunderlandkyl/Slicer, branch ci/github-actions-build) builds
+# the runtime with SlicerWeb, from the Slicer commit it builds, and publishes it to its nightly
+# release as slicerweb-wheels.zip and slicerweb-extensions.zip. This workflow:
 #
-#   python <SlicerWeb checkout>/slicerweb.py build              (in this checkout)
-#   python <SlicerWeb checkout>/slicerweb.py deploy [channel]
+#   1. takes them from there, adds the configuration of this application (application.json, but
+#      for the extensions) and records this repository in build-info.json, as SlicerWeb's build.py
+#      does, then uploads them to the release runtime-<channel> of this repository, as wheels.zip
+#      and extensions.zip;
+#   2. builds the site with the Publish app workflow of SlicerWeb, from the very SlicerWeb commit the
+#      runtime was built with (build-info.json says which), and pushes it to the branch
+#      deploy/<channel>, which GitHub Pages serves.
 #
-# (see README.md). slicerwebRef is then the commit of SlicerWeb the runtime was built from. A change
-# of the web application in SlicerWeb publishes deploy/latest again by itself (the workflow of
-# SlicerWeb, with the runtime of runtime-latest).
+# The runtime has no extensions yet: Slicer's CI does not build them, so the extensions that
+# application.json names are not part of it.
 name: Publish app
 
 on:
@@ -20,19 +23,83 @@ on:
       channel:
         description: "Channel: latest, or another (stable, 1.0.0). Published to branch deploy/<channel> from release runtime-<channel>"
         default: latest
-      slicerwebRef:
-        description: SlicerWeb branch, tag or commit whose web application is built (the one the runtime was built from)
-        default: main
+      slicerRepository:
+        description: Repository whose release holds the runtime Slicer's CI built
+        default: Sunderlandkyl/Slicer
+      slicerRelease:
+        description: That release
+        default: nightly
 
 permissions:
-  contents: write   # read the runtime release, push the site to its branch
+  contents: write   # write the runtime release, push the site to its branch
 
 jobs:
+  runtime:
+    name: Take the runtime from ${{ inputs.slicerRepository }}
+    runs-on: ubuntu-latest
+    outputs:
+      slicerwebRepository: ${{ steps.runtime.outputs.slicerwebRepository }}
+      slicerwebRef: ${{ steps.runtime.outputs.slicerwebRef }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runtime of ${{ inputs.slicerRepository }}, release ${{ inputs.slicerRelease }}
+        id: runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLICER_REPOSITORY: ${{ inputs.slicerRepository }}
+          SLICER_RELEASE: ${{ inputs.slicerRelease }}
+          RUNTIME: runtime-${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/runtime"
+          mkdir -p "$work/wheels" "$work/upload"
+          gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
+            -p slicerweb-wheels.zip -p slicerweb-extensions.zip
+          unzip -q "$work/slicerweb-wheels.zip" -d "$work/wheels"
+
+          info="$work/wheels/build-info.json"
+          cat "$info"
+          slicerwebRepository="$(jq -r '.slicerweb.repository' "$info")"
+          slicerwebRef="$(jq -r '.slicerweb.commit' "$info")"
+          echo "slicerwebRepository=$slicerwebRepository" >> "$GITHUB_OUTPUT"
+          echo "slicerwebRef=$slicerwebRef" >> "$GITHUB_OUTPUT"
+
+          # What build.py adds for an application: its configuration but for the extensions
+          # (wheels/application.json, read at startup), and its commit in build-info.json.
+          jq 'del(.extensions)' application.json > "$work/wheels/application.json"
+          jq --arg name "$GITHUB_REPOSITORY" --arg commit "$GITHUB_SHA" \
+            '. + {application: {name: $name, commit: $commit, modified: false}}' "$info" > "$info.new"
+          mv "$info.new" "$info"
+
+          (cd "$work/wheels" && zip -q -r "$work/upload/wheels.zip" .)
+          cp "$work/slicerweb-extensions.zip" "$work/upload/extensions.zip"
+
+          built="$(jq -r '.date' "$info")"
+          slicer="$(jq -r '.slicer.commit // "the revision SlicerWeb pins"' "$info")"
+          notes="WebAssembly runtime of SlicerWeb: the wheels the application is built on (VTK, ITK, the Slicer libraries and modules); no extensions yet.
+
+          Built ${built} by the continuous integration of ${SLICER_REPOSITORY} (release ${SLICER_RELEASE}), from Slicer ${slicer} and ${slicerwebRepository} ${slicerwebRef:0:7}, for ${GITHUB_REPOSITORY} ${GITHUB_SHA:0:7}."
+          if gh release view "$RUNTIME" >/dev/null 2>&1; then
+            gh release edit "$RUNTIME" --notes "$notes"
+          else
+            gh release create "$RUNTIME" --title "Runtime wheels" --notes "$notes" --prerelease --latest=false
+          fi
+          gh release upload "$RUNTIME" "$work"/upload/* --clobber
+          {
+            echo "### Runtime"
+            echo ""
+            echo "$notes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish:
-    uses: lassoan/SlicerWeb/.github/workflows/publish-app.yml@main
+    needs: runtime
+    # The workflow of the SlicerWeb that builds the runtime in Slicer's CI.
+    uses: Sunderlandkyl/SlicerWeb/.github/workflows/publish-app.yml@ci/slicer-actions
     with:
       appRepository: ${{ github.repository }}
       appBranch: deploy/${{ inputs.channel }}
       runtime: runtime-${{ inputs.channel }}
-      slicerwebRef: ${{ inputs.slicerwebRef }}
+      slicerwebRepository: ${{ needs.runtime.outputs.slicerwebRepository }}
+      slicerwebRef: ${{ needs.runtime.outputs.slicerwebRef }}
     secrets: inherit
