@@ -1,26 +1,30 @@
 # Publish the SlicerWeb application with the WebAssembly runtime that Slicer's continuous
-# integration builds, rather than one built and uploaded from a computer.
+# integration builds, and the extensions their own repositories build against it, rather than
+# with a runtime built and uploaded from a computer.
 #
 # The Build workflow of Slicer (here Sunderlandkyl/Slicer, branch ci/github-actions-build) builds
 # the runtime with SlicerWeb, from the Slicer commit it builds, and publishes it to its nightly
-# release as slicerweb-wheels.zip and slicerweb-extensions.zip. This workflow:
+# release as slicerweb-wheels.zip, with extension-repositories.json: the repositories that build
+# Slicer extensions against it. Each of those publishes, for every Slicer commit it builds against,
+# a release slicer-<commit> with its packages and extension.json, which names its web wheel and
+# holds its entry of the extension index. This workflow:
 #
-#   1. takes them from there, adds the configuration of this application (application.json, but
-#      for the extensions) and records this repository in build-info.json, as SlicerWeb's build.py
-#      does, keeps of the extensions those that application.json names in extensions.slicerweb
-#      (and those they depend on), then uploads them to the release runtime-<channel> of this
-#      repository, as wheels.zip and extensions.zip;
-#   2. builds the site with the Publish app workflow of SlicerWeb, from the very SlicerWeb commit the
-#      runtime was built with (build-info.json says which), and pushes it to the branch
-#      deploy/<channel>, which GitHub Pages serves.
+#   1. takes the runtime from there, adds the configuration of this application (application.json,
+#      but for the extensions) and records this repository in build-info.json, as SlicerWeb's
+#      build.py does;
+#   2. gathers, from each extension repository, the web wheel built against the Slicer commit of
+#      that runtime (from its release slicer-<commit>), and writes the extension index the
+#      Extensions Manager reads; an extension that has not been built against that commit is not
+#      offered. The wheels are carried by the site: a page cannot download files from GitHub
+#      releases, which refuse cross-origin requests;
+#   3. uploads both to the release runtime-<channel> of this repository, as wheels.zip and
+#      extensions.zip, and builds the site with the Publish app workflow of SlicerWeb, from the very
+#      SlicerWeb commit the runtime was built with (build-info.json says which), which pushes it to
+#      the branch deploy/<channel>, which GitHub Pages serves.
 #
-# Slicer's Build workflow starts it each time it publishes the runtime, on the default branch of
-# this repository, when the "Slicer nightly" GitHub App of that Slicer repository is installed here:
-# it starts the workflow named slicer-nightly-web.yml of every repository the app is installed in.
-# It can also be run by hand.
-#
-# Slicer's CI builds the extensions SlicerWeb describes (its extensions/ folder), so an extension of
-# this repository's own extensions/ folder is not part of the runtime: it is reported, and left out.
+# Slicer's Build workflow starts it each time it publishes the runtime (through its "Slicer
+# nightly" GitHub App, installed here). The extensions are built after that, so it also runs every
+# few hours, and publishes only when the runtime or an extension changed. It can also be run by hand.
 name: Publish app
 
 on:
@@ -35,39 +39,51 @@ on:
       slicerRelease:
         description: That release
         default: nightly
+      force:
+        description: Publish even if neither the runtime nor an extension changed
+        type: boolean
+        default: false
+  schedule:
+    - cron: "15 */4 * * *"
 
 permissions:
   contents: write   # write the runtime release, push the site to its branch
 
+env:
+  CHANNEL: ${{ inputs.channel || 'latest' }}
+  SLICER_REPOSITORY: ${{ inputs.slicerRepository || 'Sunderlandkyl/Slicer' }}
+  SLICER_RELEASE: ${{ inputs.slicerRelease || 'nightly' }}
+
 jobs:
   runtime:
-    name: Take the runtime from ${{ inputs.slicerRepository }}
+    name: Runtime and extensions
     runs-on: ubuntu-latest
     outputs:
+      changed: ${{ steps.runtime.outputs.changed }}
       slicerwebRepository: ${{ steps.runtime.outputs.slicerwebRepository }}
       slicerwebRef: ${{ steps.runtime.outputs.slicerwebRef }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Runtime of ${{ inputs.slicerRepository }}, release ${{ inputs.slicerRelease }}
+      - name: Runtime of ${{ env.SLICER_REPOSITORY }}, and the extensions built against it
         id: runtime
         env:
           GH_TOKEN: ${{ github.token }}
-          SLICER_REPOSITORY: ${{ inputs.slicerRepository }}
-          SLICER_RELEASE: ${{ inputs.slicerRelease }}
-          RUNTIME: runtime-${{ inputs.channel }}
+          RUNTIME: runtime-${{ env.CHANNEL }}
+          FORCE: ${{ inputs.force || false }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/runtime"
-          mkdir -p "$work/wheels" "$work/upload"
+          mkdir -p "$work/wheels" "$work/extensions" "$work/upload"
           gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
-            -p slicerweb-wheels.zip -p slicerweb-extensions.zip
+            -p slicerweb-wheels.zip
           unzip -q "$work/slicerweb-wheels.zip" -d "$work/wheels"
 
           info="$work/wheels/build-info.json"
           cat "$info"
           slicerwebRepository="$(jq -r '.slicerweb.repository' "$info")"
           slicerwebRef="$(jq -r '.slicerweb.commit' "$info")"
+          slicer="$(jq -r '.slicer.commit // empty' "$info")"
           echo "slicerwebRepository=$slicerwebRepository" >> "$GITHUB_OUTPUT"
           echo "slicerwebRef=$slicerwebRef" >> "$GITHUB_OUTPUT"
 
@@ -78,50 +94,71 @@ jobs:
             '. + {application: {name: $name, commit: $commit, modified: false}}' "$info" > "$info.new"
           mv "$info.new" "$info"
 
-          (cd "$work/wheels" && zip -q -r "$work/upload/wheels.zip" .)
-
-          # The extensions of this application: those application.json names, and those they
-          # depend on, out of all that Slicer's CI built. The others, their wheels and icons, are
-          # left out, as SlicerWeb's build leaves them out of an application's build.
-          mkdir -p "$work/extensions"
-          unzip -q "$work/slicerweb-extensions.zip" -d "$work/extensions"
-          python3 - "$work/extensions" application.json <<'PY'
-          import json, os, sys
-          folder, config = sys.argv[1], sys.argv[2]
-          index_path = os.path.join(folder, "index.json")
-          index = json.load(open(index_path))["extensions"]
-          by_name = {e["name"]: e for e in index}
-          wanted = list(json.load(open(config)).get("extensions", {}).get("slicerweb", []))
-          keep, missing = set(), []
-          while wanted:
-              name = wanted.pop()
-              if name in keep:
-                  continue
-              if name not in by_name:
-                  missing.append(name)
-                  continue
-              keep.add(name)
-              wanted.extend(by_name[name].get("depends", []))
-          for entry in index:
-              if entry["name"] not in keep:
-                  for f in (entry.get("wheel"), entry.get("icon")):
-                      if f and os.path.isfile(os.path.join(folder, f)):
-                          os.remove(os.path.join(folder, f))
-          json.dump({"extensions": [e for e in index if e["name"] in keep]}, open(index_path, "w"), indent=1)
-          print("Extensions:", ", ".join(sorted(keep)) or "none")
-          for name in sorted(set(missing)):
-              print(f"::warning::{name} (application.json) was not built by Slicer's CI; left out")
-          PY
-          if ls extensions/*.json >/dev/null 2>&1; then
-            echo "::warning::The extensions of extensions/ ($(cd extensions && ls *.json | sed 's/\.json$//' | xargs)) are not built by Slicer's CI; left out"
+          # The extensions: from each repository of the registry, what it built against this very
+          # Slicer commit. A release asset is public, and downloaded without the API.
+          entries="[]"
+          sources="[]"
+          if [ -z "$slicer" ]; then
+            echo "::warning::The runtime does not record its Slicer commit: no extension can be matched to it"
+          elif gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
+                 -p extension-repositories.json 2>/dev/null; then
+            prefix="$(jq -r '.release_tag_prefix // "slicer-"' "$work/extension-repositories.json")"
+            for repo in $(jq -r '.repositories[].repository' "$work/extension-repositories.json"); do
+              base="https://github.com/$repo/releases/download/$prefix$slicer"
+              if ! curl -sfL "$base/extension.json" -o "$work/extension.json"; then
+                echo "$repo: nothing built against Slicer ${slicer:0:7}"
+                continue
+              fi
+              web="$(jq -c '.web // empty' "$work/extension.json")"
+              if [ -z "$web" ]; then
+                echo "$repo: no web package for Slicer ${slicer:0:7}"
+                continue
+              fi
+              wheel="$(jq -r .wheel <<< "$web")"
+              icon="$(jq -r '.icon // empty' <<< "$web")"
+              if ! curl -sfL "$base/$wheel" -o "$work/extensions/$wheel"; then
+                echo "::warning::$repo: could not download $wheel"
+                continue
+              fi
+              if [ -n "$icon" ] && ! curl -sfL "$base/$icon" -o "$work/extensions/$icon"; then
+                echo "::warning::$repo: could not download $icon"
+                web="$(jq -c '.icon = ""' <<< "$web")"
+              fi
+              echo "$repo: $(jq -r .name <<< "$web") $(jq -r .revision "$work/extension.json")"
+              entries="$(jq -c --argjson e "$web" '. + [$e]' <<< "$entries")"
+              sources="$(jq -c --arg repo "$repo" --arg rev "$(jq -r .revision "$work/extension.json")" \
+                           --arg wheel "$wheel" '. + [{repository: $repo, revision: $rev, wheel: $wheel}]' <<< "$sources")"
+            done
+          else
+            echo "::warning::No extension-repositories.json in the $SLICER_RELEASE release of $SLICER_REPOSITORY"
           fi
+          jq -n --argjson e "$entries" '{extensions: $e}' > "$work/extensions/index.json"
+          echo "Extensions: $(jq -r '[.extensions[].name] | join(", ")' "$work/extensions/index.json")"
+
+          # What this publication is made of: unchanged since the last one, there is nothing to do.
+          jq -n --arg date "$(jq -r .date "$info")" --arg slicer "$slicer" --arg app "$GITHUB_SHA" \
+                --argjson extensions "$sources" \
+            '{runtime: {date: $date, slicer: $slicer}, application: $app, extensions: $extensions}' \
+            > "$work/upload/sources.json"
+          cat "$work/upload/sources.json"
+          changed=true
+          if [ "$FORCE" != "true" ] \
+             && gh release download "$RUNTIME" -p sources.json -O "$work/published-sources.json" 2>/dev/null \
+             && [ "$(jq -S . "$work/published-sources.json")" = "$(jq -S . "$work/upload/sources.json")" ]; then
+            changed=false
+            echo "::notice::Neither the runtime nor an extension changed since the last publication."
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          [ "$changed" = "true" ] || exit 0
+
+          (cd "$work/wheels" && zip -q -r "$work/upload/wheels.zip" .)
           (cd "$work/extensions" && zip -q -r "$work/upload/extensions.zip" .)
 
           built="$(jq -r '.date' "$info")"
-          slicer="$(jq -r '.slicer.commit // "the revision SlicerWeb pins"' "$info")"
-          notes="WebAssembly runtime of SlicerWeb: the wheels the application is built on (VTK, ITK, the Slicer libraries and modules) and the extension wheels.
+          names="$(jq -r '[.extensions[].name] | join(", ")' "$work/extensions/index.json")"
+          notes="WebAssembly runtime of SlicerWeb: the wheels the application is built on (VTK, ITK, the Slicer libraries and modules), and the extension wheels built against it: ${names:-none}.
 
-          Built ${built} by the continuous integration of ${SLICER_REPOSITORY} (release ${SLICER_RELEASE}), from Slicer ${slicer} and ${slicerwebRepository} ${slicerwebRef:0:7}, for ${GITHUB_REPOSITORY} ${GITHUB_SHA:0:7}."
+          Runtime built ${built} by the continuous integration of ${SLICER_REPOSITORY} (release ${SLICER_RELEASE}), from Slicer ${slicer:-the revision SlicerWeb pins} and ${slicerwebRepository} ${slicerwebRef:0:7}, for ${GITHUB_REPOSITORY} ${GITHUB_SHA:0:7}. sources.json says what each part comes from."
           if gh release view "$RUNTIME" >/dev/null 2>&1; then
             gh release edit "$RUNTIME" --notes "$notes"
           else
@@ -136,12 +173,13 @@ jobs:
 
   publish:
     needs: runtime
+    if: needs.runtime.outputs.changed == 'true'
     # The workflow of the SlicerWeb that builds the runtime in Slicer's CI.
     uses: Sunderlandkyl/SlicerWeb/.github/workflows/publish-app.yml@ci/slicer-actions
     with:
       appRepository: ${{ github.repository }}
-      appBranch: deploy/${{ inputs.channel }}
-      runtime: runtime-${{ inputs.channel }}
+      appBranch: deploy/${{ inputs.channel || 'latest' }}
+      runtime: runtime-${{ inputs.channel || 'latest' }}
       slicerwebRepository: ${{ needs.runtime.outputs.slicerwebRepository }}
       slicerwebRef: ${{ needs.runtime.outputs.slicerwebRef }}
     secrets: inherit

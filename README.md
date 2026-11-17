@@ -4,11 +4,12 @@
 > integration builds (the `nightly` release of
 > [Sunderlandkyl/Slicer](https://github.com/Sunderlandkyl/Slicer/releases/tag/nightly), with the
 > SlicerWeb of [Sunderlandkyl/SlicerWeb](https://github.com/Sunderlandkyl/SlicerWeb/tree/ci/slicer-actions)),
-> instead of one built and uploaded from a computer. Slicer's Build workflow starts the **Publish
-> app** workflow each time it publishes a runtime, through its "Slicer nightly" GitHub App installed
-> here; it can also be run by hand. Its extensions are those of SlicerWeb that `application.json`
-> names; those of `extensions/` here are not built. See
-> `.github/workflows/slicer-nightly-web.yml`.
+> instead of one built and uploaded from a computer, and with the extensions that their own
+> repositories build against it: those listed in the `extension-repositories.json` of that release,
+> each of which publishes what it built against a Slicer commit to its release `slicer-<commit>`.
+> The **Publish app** workflow runs when Slicer publishes a runtime (through its "Slicer nightly"
+> GitHub App installed here), and every few hours for the extensions built since, and publishes
+> when something changed; it can also be run by hand. See `.github/workflows/slicer-nightly-web.yml`.
 
 The published [SlicerWeb](https://github.com/lassoan/SlicerWeb) application:
 <https://lassoan.github.io/slicerweb-app/>
