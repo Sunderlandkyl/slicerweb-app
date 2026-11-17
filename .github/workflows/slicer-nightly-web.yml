@@ -5,15 +5,15 @@
 # The Build workflow of Slicer (here Sunderlandkyl/Slicer, branch ci/github-actions-build) builds
 # the runtime with SlicerWeb, from the Slicer commit it builds, and publishes it to its nightly
 # release as slicerweb-wheels.zip, with extension-repositories.json: the repositories that build
-# Slicer extensions against it. Each of those publishes, for every Slicer commit it builds against,
-# a release slicer-<commit> with its packages and extension.json, which names its web wheel and
+# Slicer extensions against it. Each of those publishes its packages to its nightly release, with
+# extension.json, which names its web wheel, says which Slicer commit it was built against, and
 # holds its entry of the extension index. This workflow:
 #
 #   1. takes the runtime from there, adds the configuration of this application (application.json,
 #      but for the extensions) and records this repository in build-info.json, as SlicerWeb's
 #      build.py does;
-#   2. gathers, from each extension repository, the web wheel built against the Slicer commit of
-#      that runtime (from its release slicer-<commit>), and writes the extension index the
+#   2. gathers, from the nightly release of each extension repository, the web wheel when it was
+#      built against the Slicer commit of that runtime, and writes the extension index the
 #      Extensions Manager reads; an extension that has not been built against that commit is not
 #      offered. The wheels are carried by the site: a page cannot download files from GitHub
 #      releases, which refuse cross-origin requests;
@@ -94,24 +94,30 @@ jobs:
             '. + {application: {name: $name, commit: $commit, modified: false}}' "$info" > "$info.new"
           mv "$info.new" "$info"
 
-          # The extensions: from each repository of the registry, what it built against this very
-          # Slicer commit. A release asset is public, and downloaded without the API.
+          # The extensions: from the nightly release of each repository of the registry, its web
+          # package, when it was built against this very Slicer commit (its extension.json says
+          # which). A release asset is public, and downloaded without the API.
           entries="[]"
           sources="[]"
           if [ -z "$slicer" ]; then
             echo "::warning::The runtime does not record its Slicer commit: no extension can be matched to it"
           elif gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
                  -p extension-repositories.json 2>/dev/null; then
-            prefix="$(jq -r '.release_tag_prefix // "slicer-"' "$work/extension-repositories.json")"
+            tag="$(jq -r '.release_tag // "nightly"' "$work/extension-repositories.json")"
             for repo in $(jq -r '.repositories[].repository' "$work/extension-repositories.json"); do
-              base="https://github.com/$repo/releases/download/$prefix$slicer"
+              base="https://github.com/$repo/releases/download/$tag"
               if ! curl -sfL "$base/extension.json" -o "$work/extension.json"; then
-                echo "$repo: nothing built against Slicer ${slicer:0:7}"
+                echo "$repo: no extension.json in its $tag release"
                 continue
               fi
               web="$(jq -c '.web // empty' "$work/extension.json")"
               if [ -z "$web" ]; then
-                echo "$repo: no web package for Slicer ${slicer:0:7}"
+                echo "$repo: no web package"
+                continue
+              fi
+              built="$(jq -r '.packages.web.slicer_commit // empty' "$work/extension.json")"
+              if [ "$built" != "$slicer" ]; then
+                echo "$repo: web package built against Slicer ${built:0:7}, not ${slicer:0:7}; left out"
                 continue
               fi
               wheel="$(jq -r .wheel <<< "$web")"

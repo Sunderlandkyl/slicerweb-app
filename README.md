@@ -6,7 +6,8 @@
 > SlicerWeb of [Sunderlandkyl/SlicerWeb](https://github.com/Sunderlandkyl/SlicerWeb/tree/ci/slicer-actions)),
 > instead of one built and uploaded from a computer, and with the extensions that their own
 > repositories build against it: those listed in the `extension-repositories.json` of that release,
-> each of which publishes what it built against a Slicer commit to its release `slicer-<commit>`.
+> each of which publishes its packages to its `nightly` release, saying which Slicer commit each
+> was built against.
 > The **Publish app** workflow runs when Slicer publishes a runtime (through its "Slicer nightly"
 > GitHub App installed here), and every few hours for the extensions built since, and publishes
 > when something changed; it can also be run by hand. See `.github/workflows/slicer-nightly-web.yml`.
