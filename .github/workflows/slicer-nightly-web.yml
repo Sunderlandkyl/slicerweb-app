@@ -61,6 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.runtime.outputs.changed }}
+      sources: ${{ steps.runtime.outputs.sources }}
       slicerwebRepository: ${{ steps.runtime.outputs.slicerwebRepository }}
       slicerwebRef: ${{ steps.runtime.outputs.slicerwebRef }}
     steps:
@@ -144,7 +145,11 @@ jobs:
           jq -n --argjson e "$entries" '{extensions: $e}' > "$work/extensions/index.json"
           echo "Extensions: $(jq -r '[.extensions[].name] | join(", ")' "$work/extensions/index.json")"
 
-          # What this publication is made of: unchanged since the last one, there is nothing to do.
+          # What this publication is made of. Unchanged since the last one that reached the
+          # site (deployed.json, written once the site is published), there is nothing to do.
+          # Not sources.json, which describes the runtime release and is uploaded before the
+          # site is built: a run cancelled in between would leave it saying the site is up to
+          # date when it is not, and every later run would then do nothing.
           jq -n --arg date "$(jq -r .date "$info")" --arg slicer "$slicer" --arg app "$GITHUB_SHA" \
                 --argjson extensions "$sources" \
             '{runtime: {date: $date, slicer: $slicer}, application: $app, extensions: $extensions}' \
@@ -152,12 +157,13 @@ jobs:
           cat "$work/upload/sources.json"
           changed=true
           if [ "$FORCE" != "true" ] \
-             && gh release download "$RUNTIME" -p sources.json -O "$work/published-sources.json" 2>/dev/null \
+             && gh release download "$RUNTIME" -p deployed.json -O "$work/published-sources.json" 2>/dev/null \
              && [ "$(jq -S . "$work/published-sources.json")" = "$(jq -S . "$work/upload/sources.json")" ]; then
             changed=false
             echo "::notice::Neither the runtime nor an extension changed since the last publication."
           fi
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "sources=$(jq -c . "$work/upload/sources.json")" >> "$GITHUB_OUTPUT"
           [ "$changed" = "true" ] || exit 0
 
           (cd "$work/wheels" && zip -q -r "$work/upload/wheels.zip" .)
@@ -192,3 +198,21 @@ jobs:
       slicerwebRepository: ${{ needs.runtime.outputs.slicerwebRepository }}
       slicerwebRef: ${{ needs.runtime.outputs.slicerwebRef }}
     secrets: inherit
+
+  # What the site is now made of, recorded once it is published: what the next run compares
+  # with, to know whether there is anything to do.
+  record:
+    name: Record what is published
+    needs: [runtime, publish]
+    if: needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUNTIME: runtime-${{ inputs.channel || 'latest' }}
+          SOURCES: ${{ needs.runtime.outputs.sources }}
+        run: |
+          set -euo pipefail
+          jq . <<< "$SOURCES" > deployed.json
+          gh release upload "$RUNTIME" deployed.json --clobber
