@@ -4,27 +4,28 @@
 #
 # The Build workflow of Slicer (here Sunderlandkyl/Slicer, branch ci/github-actions-build) builds
 # the runtime with SlicerWeb, from the Slicer commit it builds, and publishes it to its nightly
-# release as slicerweb-wheels.zip, with extension-repositories.json: the repositories that build
-# Slicer extensions against it. Each of those publishes its packages to its nightly release, with
-# extension.json, which names its web wheel, says which Slicer commit it was built against, and
-# holds its entry of the extension index. This workflow:
+# release as slicerweb-wheels.zip. The extensions are built against it by their own repositories,
+# in the order of their dependencies, which Slicer's Reconcile extensions workflow sees to; it
+# then publishes extensions-catalog.json to the same release: per platform, the extensions whose
+# package is built against that Slicer commit and against the very packages of the extensions it
+# depends on, with the address and the hash of each. This workflow:
 #
 #   1. takes the runtime from there, adds the configuration of this application (application.json,
 #      but for the extensions) and records this repository in build-info.json, as SlicerWeb's
 #      build.py does;
-#   2. gathers, from the nightly release of each extension repository, the web wheel when it was
-#      built against the Slicer commit of that runtime, and writes the extension index the
-#      Extensions Manager reads; an extension that has not been built against that commit is not
-#      offered. The wheels are carried by the site: a page cannot download files from GitHub
-#      releases, which refuse cross-origin requests;
+#   2. gathers the web wheels the catalog lists, when the catalog is of the Slicer commit of that
+#      runtime, checks each against its hash, and writes the extension index the Extensions
+#      Manager reads. An extension the catalog does not list (not built yet, or not consistent
+#      with what it depends on) is not offered. The wheels are carried by the site: a page cannot
+#      download files from GitHub releases, which refuse cross-origin requests;
 #   3. uploads both to the release runtime-<channel> of this repository, as wheels.zip and
 #      extensions.zip, and builds the site with the Publish app workflow of SlicerWeb, from the very
 #      SlicerWeb commit the runtime was built with (build-info.json says which), which pushes it to
 #      the branch deploy/<channel>, which GitHub Pages serves.
 #
-# Slicer's Build workflow starts it each time it publishes the runtime (through its "Slicer
-# nightly" GitHub App, installed here). The extensions are built after that, so it also runs every
-# few hours, and publishes only when the runtime or an extension changed. It can also be run by hand.
+# Slicer's Reconcile extensions workflow starts it when the catalog changed (through its "Slicer
+# nightly" GitHub App, installed here). It also runs every few hours, in case that was missed, and
+# publishes only when the runtime or an extension changed. It can also be run by hand.
 name: Publish app
 
 on:
@@ -94,51 +95,51 @@ jobs:
             '. + {application: {name: $name, commit: $commit, modified: false}}' "$info" > "$info.new"
           mv "$info.new" "$info"
 
-          # The extensions: from the nightly release of each repository of the registry, its web
-          # package, when it was built against this very Slicer commit (its extension.json says
-          # which). A release asset is public, and downloaded without the API.
+          # The extensions: the web packages of the catalog of that release, which lists the ones
+          # built against the Slicer commit of the runtime and consistent with each other. A
+          # release asset is public, and downloaded without the API.
           entries="[]"
           sources="[]"
+          catalog="$work/extensions-catalog.json"
           if [ -z "$slicer" ]; then
             echo "::warning::The runtime does not record its Slicer commit: no extension can be matched to it"
-          elif gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
-                 -p extension-repositories.json 2>/dev/null; then
-            tag="$(jq -r '.release_tag // "nightly"' "$work/extension-repositories.json")"
-            for repo in $(jq -r '.repositories[].repository' "$work/extension-repositories.json"); do
-              base="https://github.com/$repo/releases/download/$tag"
-              if ! curl -sfL "$base/extension.json" -o "$work/extension.json"; then
-                echo "$repo: no extension.json in its $tag release"
-                continue
-              fi
-              web="$(jq -c '.web // empty' "$work/extension.json")"
+          elif ! gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
+                 -p extensions-catalog.json 2>/dev/null; then
+            echo "::warning::No extensions-catalog.json in the $SLICER_RELEASE release of $SLICER_REPOSITORY"
+          elif [ "$(jq -r '.platforms.web.slicer_commit // empty' "$catalog")" != "$slicer" ]; then
+            echo "::warning::The catalog is of Slicer $(jq -r '.platforms.web.slicer_commit // "?"' "$catalog" | cut -c1-7), not ${slicer:0:7}, the runtime's: no extension offered until it is made again"
+          else
+            jq -r '.withheld.web // {} | to_entries[] | "\(.key): left out, \(.value)"' "$catalog"
+            for name in $(jq -r '.platforms.web.extensions | keys[]' "$catalog"); do
+              entry="$(jq -c --arg n "$name" '.platforms.web.extensions[$n]' "$catalog")"
+              web="$(jq -c '.web // empty' <<< "$entry")"
+              wheel="$(jq -r .file <<< "$entry")"
               if [ -z "$web" ]; then
-                echo "$repo: no web package"
+                echo "::warning::$name: no entry of the extension index in the catalog"
                 continue
               fi
-              built="$(jq -r '.packages.web.slicer_commit // empty' "$work/extension.json")"
-              if [ "$built" != "$slicer" ]; then
-                echo "$repo: web package built against Slicer ${built:0:7}, not ${slicer:0:7}; left out"
+              if ! curl -sfL --retry 3 "$(jq -r .url <<< "$entry")" -o "$work/extensions/$wheel"; then
+                echo "::warning::$name: could not download $wheel"
                 continue
               fi
-              wheel="$(jq -r .wheel <<< "$web")"
-              icon="$(jq -r '.icon // empty' <<< "$web")"
-              if ! curl -sfL "$base/$wheel" -o "$work/extensions/$wheel"; then
-                echo "::warning::$repo: could not download $wheel"
+              expected="$(jq -r '.sha256 // empty' <<< "$entry")"
+              if [ -n "$expected" ] && [ "$(sha256sum < "$work/extensions/$wheel" | cut -d' ' -f1)" != "$expected" ]; then
+                echo "::warning::$name: $wheel is not the file the catalog lists (another build was published since); left out"
+                rm -f "$work/extensions/$wheel"
                 continue
               fi
               # An icon file of the release is carried by the site; an address (the extension's
               # EXTENSION_ICONURL) is left as it is.
-              if [ -n "$icon" ] && [[ "$icon" != *://* ]] && ! curl -sfL "$base/$icon" -o "$work/extensions/$icon"; then
-                echo "::warning::$repo: could not download $icon"
+              icon="$(jq -r '.icon // empty' <<< "$web")"
+              if [ -n "$icon" ] && [[ "$icon" != *://* ]] \
+                 && ! curl -sfL --retry 3 "$(jq -r '.icon // empty' <<< "$entry")" -o "$work/extensions/$icon"; then
+                echo "::warning::$name: could not download $icon"
                 web="$(jq -c '.icon = ""' <<< "$web")"
               fi
-              echo "$repo: $(jq -r .name <<< "$web") $(jq -r .revision "$work/extension.json")"
+              echo "$name: $(jq -r .repository <<< "$entry") $(jq -r .revision <<< "$entry")"
               entries="$(jq -c --argjson e "$web" '. + [$e]' <<< "$entries")"
-              sources="$(jq -c --arg repo "$repo" --arg rev "$(jq -r .revision "$work/extension.json")" \
-                           --arg wheel "$wheel" '. + [{repository: $repo, revision: $rev, wheel: $wheel}]' <<< "$sources")"
+              sources="$(jq -c --argjson e "$entry" '. + [$e | {repository, revision, wheel: .file, sha256}]' <<< "$sources")"
             done
-          else
-            echo "::warning::No extension-repositories.json in the $SLICER_RELEASE release of $SLICER_REPOSITORY"
           fi
           jq -n --argjson e "$entries" '{extensions: $e}' > "$work/extensions/index.json"
           echo "Extensions: $(jq -r '[.extensions[].name] | join(", ")' "$work/extensions/index.json")"
