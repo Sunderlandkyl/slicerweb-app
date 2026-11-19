@@ -16,8 +16,18 @@
 #   2. gathers the web wheels the catalog lists, when the catalog is of the Slicer commit of that
 #      runtime, checks each against its hash, and writes the extension index the Extensions
 #      Manager reads. An extension the catalog does not list (not built yet, or not consistent
-#      with what it depends on) is not offered. The wheels are carried by the site: a page cannot
-#      download files from GitHub releases, which refuse cross-origin requests;
+#      with what it depends on) is not offered. The catalog gives each extension a tier: that of
+#      the Slicer ExtensionsIndex (1 to 5) when its repository is the one named there, 0 when it
+#      is not reviewed. The reviewed ones go to extensions/index.json, which the Extensions
+#      Manager offers; the others to extensions/unreviewed.json, which it offers only to a user
+#      who asks for them. One that depends on an extension that is not reviewed counts as not
+#      reviewed either.
+#      A page cannot download files from GitHub releases, which refuse cross-origin requests.
+#      With the EXTENSION_PROXY repository variable set to the address of the relay of Slicer's
+#      extension webhook, which hands them out, the index gives the address of each wheel there
+#      and the site carries none: the page checks each against the hash the index gives. Without
+#      it the site carries the wheels of the reviewed extensions, and offers no other: it does
+#      not hand out code nobody reviewed;
 #   3. uploads both to the release runtime-<channel> of this repository, as wheels.zip and
 #      extensions.zip, and builds the site with the Publish app workflow of SlicerWeb, from the very
 #      SlicerWeb commit the runtime was built with (build-info.json says which), which pushes it to
@@ -73,8 +83,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUNTIME: runtime-${{ env.CHANNEL }}
           FORCE: ${{ inputs.force || false }}
+          EXTENSION_PROXY: ${{ vars.EXTENSION_PROXY }}
         run: |
           set -euo pipefail
+          proxy="${EXTENSION_PROXY%/}"
           work="$RUNNER_TEMP/runtime"
           mkdir -p "$work/wheels" "$work/extensions" "$work/upload"
           gh release download "$SLICER_RELEASE" -R "$SLICER_REPOSITORY" -D "$work" --clobber \
@@ -100,6 +112,7 @@ jobs:
           # built against the Slicer commit of the runtime and consistent with each other. A
           # release asset is public, and downloaded without the API.
           entries="[]"
+          unreviewed="[]"
           sources="[]"
           catalog="$work/extensions-catalog.json"
           if [ -z "$slicer" ]; then
@@ -111,6 +124,18 @@ jobs:
             echo "::warning::The catalog is of Slicer $(jq -r '.platforms.web.slicer_commit // "?"' "$catalog" | cut -c1-7), not ${slicer:0:7}, the runtime's: no extension offered until it is made again"
           else
             jq -r '.withheld.web // {} | to_entries[] | "\(.key): left out, \(.value)"' "$catalog"
+            # The tier of each: its own, or 0 when anything it depends on is not reviewed.
+            tiers="$(python3 - "$catalog" <<'PY'
+          import json, sys
+          extensions = json.load(open(sys.argv[1]))["platforms"]["web"]["extensions"]
+          def tier(name, seen=()):
+              entry = extensions.get(name)
+              if entry is None or name in seen:
+                  return 0 if entry is None else int(entry.get("tier") or 0)
+              return min([int(entry.get("tier") or 0)] + [tier(d, seen + (name,)) for d in entry.get("depends") or []])
+          print(json.dumps({name: tier(name) for name in extensions}))
+          PY
+            )"
             for name in $(jq -r '.platforms.web.extensions | keys[]' "$catalog"); do
               entry="$(jq -c --arg n "$name" '.platforms.web.extensions[$n]' "$catalog")"
               web="$(jq -c '.web // empty' <<< "$entry")"
@@ -119,31 +144,63 @@ jobs:
                 echo "::warning::$name: no entry of the extension index in the catalog"
                 continue
               fi
-              if ! curl -sfL --retry 3 "$(jq -r .url <<< "$entry")" -o "$work/extensions/$wheel"; then
-                echo "::warning::$name: could not download $wheel"
-                continue
-              fi
+              tier="$(jq -r --arg n "$name" '.[$n] // 0' <<< "$tiers")"
               expected="$(jq -r '.sha256 // empty' <<< "$entry")"
-              if [ -n "$expected" ] && [ "$(sha256sum < "$work/extensions/$wheel" | cut -d' ' -f1)" != "$expected" ]; then
-                echo "::warning::$name: $wheel is not the file the catalog lists (another build was published since); left out"
-                rm -f "$work/extensions/$wheel"
-                continue
-              fi
-              # An icon file of the release is carried by the site; an address (the extension's
-              # EXTENSION_ICONURL) is left as it is.
               icon="$(jq -r '.icon // empty' <<< "$web")"
-              if [ -n "$icon" ] && [[ "$icon" != *://* ]] \
-                 && ! curl -sfL --retry 3 "$(jq -r '.icon // empty' <<< "$entry")" -o "$work/extensions/$icon"; then
-                echo "::warning::$name: could not download $icon"
-                web="$(jq -c '.icon = ""' <<< "$web")"
+              if [ -n "$proxy" ]; then
+                # Nothing is carried: the wheel is read through the relay, which hands out the
+                # files of the release, and checked by the page against this hash. An image
+                # needs no relay.
+                if [ -z "$expected" ]; then
+                  echo "::warning::$name: the catalog gives no hash for $wheel; left out"
+                  continue
+                fi
+                address="$(jq -r .url <<< "$entry" | sed -E "s#^https://github.com/([^/]+/[^/]+)/releases/download/#$proxy/gh/\\1/#")"
+                if [[ "$address" != "$proxy/gh/"* ]]; then
+                  echo "::warning::$name: $(jq -r .url <<< "$entry") is not a file of a GitHub release; left out"
+                  continue
+                fi
+                web="$(jq -c --arg w "$address" '.wheel = $w' <<< "$web")"
+                if [ -n "$icon" ] && [[ "$icon" != *://* ]]; then
+                  web="$(jq -c --arg i "$(jq -r '.icon // empty' <<< "$entry")" '.icon = $i' <<< "$web")"
+                fi
+              else
+                if [ "$tier" -lt 1 ]; then
+                  echo "$name: not reviewed (tier 0); not carried by the site, and not offered without EXTENSION_PROXY"
+                  continue
+                fi
+                if ! curl -sfL --retry 3 "$(jq -r .url <<< "$entry")" -o "$work/extensions/$wheel"; then
+                  echo "::warning::$name: could not download $wheel"
+                  continue
+                fi
+                if [ -n "$expected" ] && [ "$(sha256sum < "$work/extensions/$wheel" | cut -d' ' -f1)" != "$expected" ]; then
+                  echo "::warning::$name: $wheel is not the file the catalog lists (another build was published since); left out"
+                  rm -f "$work/extensions/$wheel"
+                  continue
+                fi
+                # An icon file of the release is carried by the site; an address (the extension's
+                # EXTENSION_ICONURL) is left as it is.
+                if [ -n "$icon" ] && [[ "$icon" != *://* ]] \
+                   && ! curl -sfL --retry 3 "$(jq -r '.icon // empty' <<< "$entry")" -o "$work/extensions/$icon"; then
+                  echo "::warning::$name: could not download $icon"
+                  web="$(jq -c '.icon = ""' <<< "$web")"
+                fi
               fi
-              echo "$name: $(jq -r .repository <<< "$entry") $(jq -r .revision <<< "$entry")"
-              entries="$(jq -c --argjson e "$web" '. + [$e]' <<< "$entries")"
-              sources="$(jq -c --argjson e "$entry" '. + [$e | {repository, revision, wheel: .file, sha256}]' <<< "$sources")"
+              web="$(jq -c --arg s "$expected" --argjson t "$tier" '. + {sha256: $s, tier: $t}' <<< "$web")"
+              echo "$name: $(jq -r .repository <<< "$entry") $(jq -r .revision <<< "$entry"), tier $tier"
+              if [ "$tier" -ge 1 ]; then
+                entries="$(jq -c --argjson e "$web" '. + [$e]' <<< "$entries")"
+              else
+                unreviewed="$(jq -c --argjson e "$web" '. + [$e]' <<< "$unreviewed")"
+              fi
+              sources="$(jq -c --argjson e "$entry" --argjson t "$tier" --arg w "$(jq -r .wheel <<< "$web")" \
+                '. + [$e | {repository, revision, wheel: $w, sha256, tier: $t}]' <<< "$sources")"
             done
           fi
           jq -n --argjson e "$entries" '{extensions: $e}' > "$work/extensions/index.json"
+          jq -n --argjson e "$unreviewed" '{extensions: $e}' > "$work/extensions/unreviewed.json"
           echo "Extensions: $(jq -r '[.extensions[].name] | join(", ")' "$work/extensions/index.json")"
+          echo "Not reviewed: $(jq -r '[.extensions[].name] | join(", ") | if . == "" then "none" else . end' "$work/extensions/unreviewed.json")"
 
           # What this publication is made of. Unchanged since the last one that reached the
           # site (deployed.json, written once the site is published), there is nothing to do.
