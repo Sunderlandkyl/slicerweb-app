@@ -1,0 +1,17 @@
+async function e(e){let t=new Uint8Array(await crypto.subtle.digest(`SHA-256`,e));return Array.from(t,e=>e.toString(16).padStart(2,`0`)).join(``)}async function t(t,n,r,i,a){if(!i){await n.install(r,a);return}let o=await fetch(r);if(!o.ok)throw Error(`${r}: HTTP ${o.status}`);let s=new Uint8Array(await o.arrayBuffer()),c=await e(s);if(c!==i.toLowerCase())throw Error(`${r} is not the file its extension index describes (sha256 ${c.slice(0,12)}…, expected ${i.slice(0,12)}…): not installed`);let l=decodeURIComponent(new URL(r,`file:///`).pathname.split(`/`).pop()??``);if(!/^[A-Za-z0-9_.+-]+\.whl$/.test(l))throw Error(`${r} does not end with the file name of a wheel`);let u=`/tmp/slicerweb-wheels`;t.FS.mkdirTree(u);let d=`${u}/${l}`;t.FS.writeFile(d,s);try{await n.install(`emfs:${d}`,a)}finally{try{t.FS.unlink(d)}catch{}}}let n=null,r=null;function i(e,t=[]){self.postMessage(e,t)}async function a(e){let{loadPyodide:r}=await import(
+/* @vite-ignore */
+e.pyodideURL+`pyodide.mjs`);n=await r({indexURL:e.pyodideURL,packageBaseUrl:e.pyodidePackagesURL,stdout:e=>i({type:`log`,level:`INFO`,message:e}),stderr:e=>i({type:`log`,level:`ERROR`,message:e}),env:{HOME:`/home/pyodide`,SLICERWEB:`1`,SLICERWEB_JOB:`1`}}),n.runPython(`
+import os, sysconfig
+_sp = sysconfig.get_paths()["purelib"]
+_dirs = [f"{_sp}/vtk_libs", f"{_sp}/slicerweb_itk", f"{_sp}/slicer_home/lib/Slicer-${e.slicerVersion}",
+         f"{_sp}/slicer_home/lib/Slicer-${e.slicerVersion}/qt-loadable-modules"]
+os.environ["LD_LIBRARY_PATH"] = ":".join(_dirs + [os.environ.get("LD_LIBRARY_PATH", "")])
+`),await n.loadPackage(e.pyodidePackages,{messageCallback:()=>{}});let a=n.pyimport(`micropip`);for(let r of e.wheels)i({type:`progress`,message:`Loading ${r.split(`/`).pop()}`,fraction:.5}),await t(n,a,r,e.wheelHashes?.[r],{keep_going:!0});n.registerJsModule(`slicerweb_job`,{progress:(e,t)=>i({type:`progress`,message:e,fraction:t}),log:(e,t)=>i({type:`log`,level:e,message:t})}),n.runPython(`
+import sys, sysconfig
+_sp = sysconfig.get_paths()["purelib"]
+for _dir in (f"{_sp}/slicer_home/lib/Slicer-${e.slicerVersion}",
+             f"{_sp}/slicer_home/lib/Slicer-${e.slicerVersion}/qt-loadable-modules",
+             f"{_sp}/slicer_home/lib/Slicer-${e.slicerVersion}/qt-scripted-modules"):
+    if _dir not in sys.path:
+        sys.path.append(_dir)
+`),n.FS.mkdirTree(`/work`),i({type:`ready`})}async function o(e){r&&await r;try{e.packages?.length&&(i({type:`progress`,id:e.id,message:`Loading ${e.packages.join(`, `)}`,fraction:0}),await n.loadPackage(e.packages,{messageCallback:()=>{}}));for(let[t,r]of Object.entries(e.files??{})){let e=t.slice(0,t.lastIndexOf(`/`));e&&n.FS.mkdirTree(e),n.FS.writeFile(t,r)}let t=n.toPy({...e.globals??{},result:null});await n.runPythonAsync(e.code,{globals:t});let r=t.get(`result`),a={};for(let t of e.outputs??[])try{a[t]=n.FS.readFile(t)}catch{}i({type:`done`,id:e.id,result:r?.toJs?r.toJs({dict_converter:Object.fromEntries}):r,files:a},Object.values(a).map(e=>e.buffer)),r?.destroy?.(),t.destroy()}catch(t){i({type:`failed`,id:e.id,error:String(t?.message??t)})}}self.onmessage=async e=>{let t=e.data;t.type===`start`?(r=a(t).catch(e=>{i({type:`failed`,error:String(e?.message??e)})}),await r):t.type===`run`?await o(t):t.type===`cancel`&&self.close()};
